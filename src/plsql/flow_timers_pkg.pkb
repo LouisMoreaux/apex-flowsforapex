@@ -24,8 +24,8 @@ as
          and objt.objt_dgrm_id = prcs.prcs_dgrm_id
        where sbfl.sbfl_id = pi_sbfl_id
          and sbfl.sbfl_prcs_id = pi_prcs_id
-         and objt.objt_sub_tag_name = 'bpmn:timerEventDefinition'
-         ;
+         and objt.objt_sub_tag_name = flow_constants_pkg.gc_bpmn_timer_event_definition
+      ;
     exception
       when no_data_found then
         -- check for an interupting timer boundary event attached
@@ -43,26 +43,33 @@ as
              and boundary_objt.objt_dgrm_id = prcs.prcs_dgrm_id
            where sbfl.sbfl_id = pi_sbfl_id
              and prcs.prcs_id = pi_prcs_id
-             and boundary_objt.objt_sub_tag_name = 'bpmn:timerEventDefinition'
+             and boundary_objt.objt_sub_tag_name = flow_constants_pkg.gc_bpmn_timer_event_definition
              and boundary_objt.objt_interrupting = 1
-             ;
+          ;
         exception
           when no_data_found then
             apex_error.add_error
-            ( p_message => 'Error finding object with timer in get_timer_definition. Subflow '||pi_sbfl_id||' .'
+            ( 
+              p_message => 'Error finding object with timer in get_timer_definition. Subflow '||pi_sbfl_id||' .'
             , p_display_location => apex_error.c_on_error_page
             );
         end;
     end;
-    apex_debug.message(p_message => 'get_timer_definition.  Getting timer definition for object '||l_objt_with_timer||
-                       ' on subflow '|| pi_sbfl_id, p_level => 4) ;
-    begin 
+    apex_debug.info
+    (
+      p_message => 'get_timer_definition.  Getting timer definition for object %s on subflow %s'
+    , p0        => l_objt_with_timer
+    , p1        => pi_sbfl_id
+    );
+
+    begin
       for rec in (
-                  select obat.obat_key
+                   select obat.obat_key
                         , obat.obat_vc_value
-                    from flow_object_attributes obat
+                     from flow_object_attributes obat
                     where obat.obat_objt_id = l_objt_with_timer
-                  )
+                      and obat.obat_key in ( flow_constants_pkg.gc_timer_type_key, flow_constants_pkg.gc_timer_def_key )
+                 )
       loop
         case rec.obat_key
           when flow_constants_pkg.gc_timer_type_key then
@@ -82,15 +89,12 @@ as
     end;
   end get_timer_definition;
 
-/******************************************************************************
-  STEP_TIMERS
-******************************************************************************/
   procedure step_timers
   is
     cursor timr_cur is
       select *
         from flow_timers
-        where timr_status in (c_created, c_active)
+       where timr_status in ( c_created, c_active )
      order by timr_created_on
           for update of timr_last_run
                       , timr_run_count
@@ -100,14 +104,13 @@ as
     e_timer_already_removed exception;
     pragma exception_init( e_timer_already_removed, -8006 );
   begin
-    for rec in timr_cur
-    loop
+    for rec in timr_cur loop
       begin
         case rec.timr_type
           when flow_constants_pkg.gc_timer_type_cycle then
             if (   rec.timr_start_on
-                 + ( rec.timr_interval_ym * coalesce( rec.timr_run_count, 1) )
-                 + ( rec.timr_interval_ds * coalesce(rec.timr_run_count, 1) )
+                 + ( rec.timr_interval_ym * coalesce( rec.timr_run_count, 1 ) )
+                 + ( rec.timr_interval_ds * coalesce( rec.timr_run_count, 1 ) )
                ) <= systimestamp
             then
               update flow_timers
@@ -144,53 +147,69 @@ as
           -- This is in the nature of timers as one might fire,
           -- cleans up a whole subflow including any timers on that subflow.
           null;
+        when others then
+          -- Some exception happened during processing the timer
+          -- We trap it here and mark respective timer as broken.
+          update flow_timers
+             set timr_status = c_broken
+           where current of timr_cur
+          ;
       end;
     end loop;
   end step_timers;
 
-/******************************************************************************
-  GET_DURATION
-******************************************************************************/
+  procedure get_duration
+  (
+    in_string     in     varchar2
+  , in_start_ts   in     timestamp with time zone default null
+  , out_start_ts     out timestamp with time zone
+  , out_interv_ym in out interval year to month
+  , out_interv_ds in out interval day to second
+  )
+  as
+    type t_duration_components is table of number index by varchar2(1 char);
 
-  procedure get_duration (
-    in_string            in      varchar2
-  , in_start_ts          in     timestamp with time zone default null
-  , out_start_ts            out timestamp with time zone
-  , out_interv_ym        in out interval year to month
-  , out_interv_ds        in out interval day to second
-  ) is
-    l_int_years     number;
-    l_int_months    number;
-    l_int_days      number;
-    l_int_contains  varchar2 (2);
+    l_start_pos_time  pls_integer;
+    l_token_count     pls_integer;
+    l_before_t        varchar2(200 char);
+    l_after_t         varchar2(200 char);
+    l_ym_part         varchar2(200 char);
+    l_ds_part         varchar2(200 char);
+
+    l_cur_component   varchar2(200 char);    
   begin
-    if regexp_replace (in_string, '[0-9]', '') like 'PYM%' then
-      l_int_contains  := 'M';
-      l_int_years     := substr (in_string, 2, instr (in_string, 'Y', 1) - 2);
-      l_int_months    := substr (in_string, instr (in_string, 'Y', 1) + 1, instr (in_string, 'M', 1) - instr (in_string, 'Y', 1) - 1);
+    -- first split the string to year-month and day-second parts
+    -- afterwards operate on both separately
+    -- because M before T means months and M after T means minutes
 
-    elsif regexp_replace (in_string, '[0-9]', '') like 'PY%' then
-      l_int_contains  := 'Y';
-      l_int_years     := substr (in_string, 2, instr (in_string, 'Y', 1) - 2);
-
-    elsif regexp_replace (in_string, '[0-9]', '') like 'PM%' then
-      l_int_contains  := 'M';
-      l_int_months    := substr (in_string, 2, instr (in_string, 'M', 1) - 2);
-
+    l_start_pos_time := instr( in_string, 'T' );
+    if l_start_pos_time = 0 then
+      l_before_t := in_string;
+    else
+      l_before_t       := substr( in_string, 1, l_start_pos_time - 1 );
+      l_after_t        := substr( in_string, l_start_pos_time);
     end if;
 
-    if regexp_replace (in_string, '[0-9]', '') like 'PT%' then
-      l_int_contains  := 'PT';
-      out_interv_ds   := nvl (to_dsinterval (substr (in_string, instr (in_string, l_int_contains, 1))), INTERVAL '0' HOUR);
+    -- The day indicator comes before the "T"
+    -- however day needs to be handle with ds_interval
+    l_token_count := regexp_count( l_before_t, '\d+\w' );
+    for i in 1..l_token_count loop
+      l_cur_component := regexp_substr(l_before_t, '\d+\w', 1, i);
 
-    else 
-      l_int_contains  := 'T';
-      out_interv_ds := nvl (to_dsinterval (substr (in_string, instr (in_string, l_int_contains, 1))), INTERVAL '0' HOUR);
+      case substr(l_cur_component, -1)
+        when 'Y' then l_ym_part := l_ym_part || l_cur_component;
+        when 'M' then l_ym_part := l_ym_part || l_cur_component;
+        when 'D' then l_ds_part := l_ds_part || l_cur_component;
+        else null;
+      end case;
+    end loop;
 
-    end if;
+    l_ds_part := l_ds_part || l_after_t;
 
-    out_interv_ym := numtoyminterval (nvl (l_int_years, 0), 'YEAR') + numtoyminterval (nvl (l_int_months, 0), 'MONTH');
-    out_start_ts  := nvl (in_start_ts, systimestamp) + out_interv_ym + out_interv_ds;
+    out_interv_ym := to_yminterval( 'P' || coalesce(l_ym_part, '0Y') );
+    out_interv_ds := to_dsinterval( 'P' || coalesce(l_ds_part, '0D') );
+
+    out_start_ts  := coalesce( in_start_ts, systimestamp ) + out_interv_ym + out_interv_ds;
 
   end get_duration;
 
@@ -203,7 +222,7 @@ as
     pi_prcs_id in flow_processes.prcs_id%type
   , pi_sbfl_id in flow_subflows.sbfl_id%type
   )
-  is
+  as
     l_parsed_ts           flow_timers.timr_start_on%type;
     l_parsed_duration_ym  flow_timers.timr_interval_ym%type;
     l_parsed_duration_ds  flow_timers.timr_interval_ds%type;
@@ -219,11 +238,38 @@ as
     , po_timer_type => l_timer_type
     , po_timer_def  => l_timer_def
     );
-    apex_debug.message(p_message => 'starting timer on subflow '||pi_sbfl_id||' type '||l_timer_type||' def '||l_timer_def, p_level => 4) ;
+    apex_debug.info
+    (
+      p_message => 'starting timer on subflow %s, type %s, def %s'
+    , p0        => pi_sbfl_id
+    , p1        => l_timer_type
+    , p2        => l_timer_def
+    );
     case l_timer_type
       when flow_constants_pkg.gc_timer_type_date then
-        l_parsed_ts := to_timestamp_tz( replace ( l_timer_def, 'T', ' ' ), 'YYYY-MM-DD HH24:MI:SS TZR' );
+        -- check for substitution of process variable
+        if upper(substr(l_timer_def,1,5)) = flow_constants_pkg.gc_substitution_prefix || flow_constants_pkg.gc_substitution_flow_identifier then
+          l_parsed_ts :=
+            flow_process_vars.get_var_date
+            ( 
+              pi_prcs_id  => pi_prcs_id
+            , pi_var_name => substr(l_timer_def,6,length(l_timer_def)-6)
+            )
+          ;
+        else
+          l_parsed_ts := to_timestamp_tz( replace ( l_timer_def, 'T', ' ' ), 'YYYY-MM-DD HH24:MI:SS TZR' );
+        end if;
       when flow_constants_pkg.gc_timer_type_duration then
+        -- check for substitution of process variable
+        if upper(substr(l_timer_def,1,5)) = flow_constants_pkg.gc_substitution_prefix || flow_constants_pkg.gc_substitution_flow_identifier then
+          l_timer_def :=
+            flow_process_vars.get_var_vc2
+            ( 
+              pi_prcs_id  => pi_prcs_id
+            , pi_var_name => substr(l_timer_def,6,length(l_timer_def)-6)
+            )
+          ;
+        end if;     
         get_duration
         (
           in_string     => l_timer_def
@@ -233,6 +279,14 @@ as
         , out_interv_ds => l_parsed_duration_ds
         );
       when flow_constants_pkg.gc_timer_type_cycle then
+        if upper( substr( l_timer_def, 1, 5 ) ) = flow_constants_pkg.gc_substitution_prefix || flow_constants_pkg.gc_substitution_flow_identifier then
+          l_timer_def :=
+            flow_process_vars.get_var_vc2
+            ( pi_prcs_id  => pi_prcs_id
+            , pi_var_name => substr( l_timer_def, 6, length(l_timer_def) - 6 )
+            )
+          ;
+        end if;
         l_repeat_times := substr( l_timer_def, 2, instr( l_timer_def, '/', 1, 1 ) - 2 );
         l_timer_def    := substr( l_timer_def, instr( l_timer_def, '/', 1, 1 ) + 1 );
         get_duration
@@ -244,11 +298,11 @@ as
         , out_interv_ds => l_parsed_duration_ds
         );
       else
-            apex_error.add_error
-            ( p_message => 'No timer definitions found in start_timer on subflow '||pi_sbfl_id||' type '||l_timer_type||' def '||l_timer_def
-            , p_display_location => apex_error.c_on_error_page
-            );
-
+        apex_error.add_error
+        ( 
+          p_message => 'No timer definitions found in start_timer on subflow '||pi_sbfl_id||' type '||l_timer_type||' def '||l_timer_def
+        , p_display_location => apex_error.c_on_error_page
+        );
     end case;
 
     insert into flow_timers
@@ -290,10 +344,11 @@ as
   is
   begin
     update flow_timers
-    set timr_status = c_expired
-    where timr_prcs_id = pi_prcs_id
-      and timr_sbfl_id = pi_sbfl_id
-      and timr_status not in (c_ended, c_expired, c_terminated);
+       set timr_status = c_expired
+     where timr_prcs_id = pi_prcs_id
+       and timr_sbfl_id = pi_sbfl_id
+       and timr_status not in (c_ended, c_expired, c_terminated)
+    ;
   end expire_timer;
 
 /******************************************************************************
@@ -312,7 +367,8 @@ as
        set timr_status = c_terminated
      where timr_prcs_id = pi_prcs_id
        and timr_sbfl_id = pi_sbfl_id
-       and timr_status not in (c_ended, c_expired, c_terminated);
+       and timr_status not in (c_ended, c_expired, c_terminated)
+    ;
   end terminate_timer;
 
 /******************************************************************************
@@ -327,9 +383,10 @@ as
   is
   begin
     update flow_timers
-    set timr_status = c_terminated
-    where timr_prcs_id = pi_prcs_id
-      and timr_status not in (c_ended, c_expired, c_terminated);
+       set timr_status = c_terminated
+     where timr_prcs_id = pi_prcs_id
+       and timr_status not in (c_ended, c_expired, c_terminated)
+    ;
   end terminate_process_timers;
 
 /******************************************************************************
@@ -366,24 +423,24 @@ as
     ;
   end delete_process_timers;
 
-
-
-/******************************************************************************
-  DISABLE_SCHEDULED_JOB
-******************************************************************************/
-
-  procedure disable_scheduled_job is
+  procedure disable_scheduled_job
+  as
   begin
-    dbms_scheduler.disable (name => 'apex_flow_step_timers_j');
+    execute immediate
+    q'[begin
+    dbms_scheduler.disable( name => 'apex_flow_step_timers_j' );
+    end;
+    /]';
   end;
 
-/******************************************************************************
-  ENABLE_SCHEDULED_JOB
-******************************************************************************/
-
-  procedure enable_scheduled_job is
+  procedure enable_scheduled_job
+  as
   begin
-    dbms_scheduler.enable (name => 'apex_flow_step_timers_j');
+    execute immediate
+    q'[begin
+    dbms_scheduler.enable( name => 'apex_flow_step_timers_j' );
+    end;
+    /]';
   end;
 
 end flow_timers_pkg;
